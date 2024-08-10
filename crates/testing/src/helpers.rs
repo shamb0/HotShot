@@ -7,6 +7,7 @@
 #![allow(clippy::panic)]
 use std::{fmt::Debug, hash::Hash, marker::PhantomData, sync::Arc};
 
+use anyhow::Context;
 use async_broadcast::{Receiver, Sender};
 use bitvec::bitvec;
 use committable::Committable;
@@ -44,7 +45,7 @@ use hotshot_types::{
 use jf_vid::VidScheme;
 use serde::Serialize;
 
-use crate::test_builder::TestDescription;
+use crate::{test_builder::TestDescription, test_launcher::TestLauncher};
 
 /// create the [`SystemContextHandle`] from a node id
 /// # Panics
@@ -124,6 +125,94 @@ pub async fn build_system_handle<
     .await
     .expect("Could not init hotshot")
 }
+
+
+pub async fn build_system_handle_from_launcher<
+    TYPES: NodeType<InstanceState = TestInstanceState>,
+    I: NodeImplementation<
+            TYPES,
+            Storage = TestStorage<TYPES>,
+            AuctionResultsProvider = TestAuctionResultsProvider<TYPES>,
+        > + TestableNodeImplementation<TYPES>,
+>(
+    node_id: u64,
+    launcher: TestLauncher<TYPES, I>,
+    membership_config: Option<Memberships<TYPES>>,
+) -> Result<
+    (
+        SystemContextHandle<TYPES, I>,
+        Sender<Arc<HotShotEvent<TYPES>>>,
+        Receiver<Arc<HotShotEvent<TYPES>>>,
+    ),
+    anyhow::Error,
+> {
+    tracing::info!("Creating system handle for node {}", node_id);
+
+    let network = (launcher.resource_generator.channel_generator)(node_id).await;
+    let storage = (launcher.resource_generator.storage)(node_id);
+    let marketplace_config = (launcher.resource_generator.marketplace_config)(node_id);
+    let config = launcher.resource_generator.config.clone();
+
+    let known_nodes_with_stake = config.known_nodes_with_stake.clone();
+    let private_key = config.my_own_validator_config.private_key.clone();
+    let public_key = config.my_own_validator_config.public_key.clone();
+
+    let _known_nodes_without_stake = config.known_nodes_without_stake.clone();
+
+    let memberships = if membership_config.is_none() {
+        Memberships {
+            quorum_membership: TYPES::Membership::create_election(
+                known_nodes_with_stake.clone(),
+                known_nodes_with_stake.clone(),
+                Topic::Global,
+                config.fixed_leader_for_gpuvid,
+            ),
+            da_membership: TYPES::Membership::create_election(
+                known_nodes_with_stake.clone(),
+                config.known_da_nodes.clone(),
+                Topic::Da,
+                config.fixed_leader_for_gpuvid,
+            ),
+            vid_membership: TYPES::Membership::create_election(
+                known_nodes_with_stake.clone(),
+                known_nodes_with_stake.clone(),
+                Topic::Global,
+                config.fixed_leader_for_gpuvid,
+            ),
+            view_sync_membership: TYPES::Membership::create_election(
+                known_nodes_with_stake.clone(),
+                known_nodes_with_stake,
+                Topic::Global,
+                config.fixed_leader_for_gpuvid,
+            ),
+        }
+    } else {
+        membership_config.unwrap()
+    };
+
+    let initializer = HotShotInitializer::<TYPES>::from_genesis(TestInstanceState {})
+        .await
+        .unwrap();
+
+    let result = SystemContext::init(
+        public_key,
+        private_key,
+        node_id,
+        config,
+        memberships,
+        network,
+        initializer,
+        ConsensusMetricsValue::default(),
+        storage,
+        marketplace_config,
+    )
+    .await
+    .context("Failed to initialize HotShot")?;
+
+    tracing::info!("Successfully created system handle for node {}", node_id);
+    Ok(result)
+}
+
 
 /// create certificate
 /// # Panics
