@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use async_compatibility_layer::art::async_timeout;
 use futures::StreamExt;
 use hotshot::tasks::task_state::CreateTaskState;
 use hotshot_example_types::{
@@ -10,11 +9,8 @@ use hotshot_example_types::{
 use hotshot_macros::{run_test, test_scripts};
 use hotshot_task_impls::{da::DaTaskState, events::HotShotEvent};
 use hotshot_testing::{
-    helpers::build_system_handle_from_launcher,
-    predicates::{
-        event::{exact, expect_external_events, ext_event_exact},
-        PredicateResult,
-    },
+    helpers::{build_system_handle_from_launcher, check_external_events},
+    predicates::event::{exact, expect_external_events, ext_event_exact},
     script::{Expectations, InputOrder, TaskScript},
     serial,
     test_builder::TestDescription,
@@ -126,42 +122,16 @@ async fn test_da_task_outdated_proposal() {
         expectations: expectations,
     };
 
-    let mut output_event_stream_recv = handle.event_stream();
+    let output_event_stream_recv = handle.event_stream();
 
     run_test![inputs, da_script].await;
 
     // Check external events
-    let mut external_event_expectations_met = vec![false; external_event_expectations.len()];
-
-    while let Ok(Some(ext_event_received_output)) =
-        async_timeout(da_script.timeout, output_event_stream_recv.next()).await
-    {
-        tracing::debug!("Test received Ext Event: {:?}", ext_event_received_output);
-
-        for (index, expectation) in external_event_expectations.iter().enumerate() {
-            if !external_event_expectations_met[index] {
-                for predicate in &expectation.output_asserts {
-                    if predicate
-                        .evaluate(&Arc::new(ext_event_received_output.clone()))
-                        .await
-                        == PredicateResult::Pass
-                    {
-                        external_event_expectations_met[index] = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Check if all expectations are met
-        if external_event_expectations_met.iter().all(|&x| x) {
-            break;
-        }
-    }
-
-    // Assert that all external event expectations were met
-    assert!(
-        external_event_expectations_met.iter().all(|&x| x),
-        "Not all external event expectations were met"
-    );
+    let result = check_external_events(
+        output_event_stream_recv,
+        &external_event_expectations,
+        da_script.timeout,
+    )
+    .await;
+    assert!(result.is_ok(), "{}", result.err().unwrap());
 }
