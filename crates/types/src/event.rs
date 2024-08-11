@@ -173,6 +173,32 @@ pub enum EventType<TYPES: NodeType> {
     /// A message destined for external listeners was received
     ExternalMessageReceived(Vec<u8>),
 }
+
+// Implement Eq as well, since EventType should have reflexive equality
+impl<TYPES: NodeType> Eq for EventType<TYPES> {}
+
+impl<TYPES: NodeType> PartialEq for EventType<TYPES> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                EventType::DaProposal {
+                    proposal: p1,
+                    sender: s1,
+                },
+                EventType::DaProposal {
+                    proposal: p2,
+                    sender: s2,
+                },
+            ) => {
+                // Implement equality check for DaProposal
+                p1 == p2 && s1 == s2
+            }
+            // For all other variants, panic with a TODO message
+            _ => panic!("TODO: Equality not yet implemented for this EventType variant"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 /// A list of actions that we track for nodes
 pub enum HotShotAction {
