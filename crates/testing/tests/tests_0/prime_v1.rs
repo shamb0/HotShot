@@ -26,21 +26,29 @@ use hotshot_types::{
     },
 };
 
+/// Test the DA Task for handling an outdated proposal.
+/// 
+/// This test checks that when an outdated DA proposal is received, it doesn't produce 
+/// any output, while a current proposal triggers appropriate actions (validation and voting).
 #[cfg_attr(async_executor_impl = "tokio", tokio::test(flavor = "multi_thread"))]
 #[cfg_attr(async_executor_impl = "async-std", async_std::test)]
 async fn test_da_task_outdated_proposal() {
+    // Setup logging and backtrace for debugging
     async_compatibility_layer::logging::setup_logging();
     async_compatibility_layer::logging::setup_backtrace();
 
+    // Parameters for the test
     let node_id: u64 = 2;
     let num_nodes: usize = 10;
     let da_committee_size: usize = 7;
 
+    // Initialize test description with node and committee details
     let mut test_description = TestDescription::default();
     test_description.num_nodes_with_stake = num_nodes;
     test_description.da_staked_committee_size = da_committee_size;
     test_description.start_nodes = num_nodes;
 
+    // Generate a launcher for the test system with a custom configuration
     let launcher = test_description
         .gen_launcher(node_id)
         .modify_default_config(|config| {
@@ -49,13 +57,13 @@ async fn test_da_task_outdated_proposal() {
             config.da_staked_committee_size = da_committee_size;
         });
 
+    // Build the system handle using the launcher configuration
     let (handle, _event_sender, _event_receiver) =
         build_system_handle_from_launcher::<TestTypes, MemoryImpl>(node_id, launcher, None)
             .await
             .expect("Failed to initialize HotShot");
 
-    // Make some empty encoded transactions, we just care about having a commitment handy for the
-    // later calls. We need the VID commitment to be able to propose later.
+    // Prepare empty transactions and compute a commitment for later use
     let transactions = vec![TestTransaction::new(vec![0])];
     let encoded_transactions = Arc::from(TestTransaction::encode(&transactions));
     let (payload_commit, _precompute) = precompute_vid_commitment(
@@ -63,20 +71,21 @@ async fn test_da_task_outdated_proposal() {
         handle.hotshot.memberships.quorum_membership.total_nodes(),
     );
 
+    // Initialize a view generator using the current memberships
     let mut view_generator = TestViewGenerator::generate(
         handle.hotshot.memberships.quorum_membership.clone(),
         handle.hotshot.memberships.da_membership.clone(),
     );
 
-    // Generate views
+    // Generate views for the test
     let view1 = view_generator.next().await.unwrap();
     let _view2 = view_generator.next().await.unwrap();
-
     view_generator.add_transactions(transactions);
-
     let view3 = view_generator.next().await.unwrap();
 
-    // Prepare inputs
+    // Define input events for the test:
+    // 1. Three view changes and an outdated proposal for view 1 when in view 3
+    // 2. A current proposal for view 3
     let inputs = vec![
         serial![
             HotShotEvent::ViewChange(ViewNumber::new(1)),
@@ -91,8 +100,11 @@ async fn test_da_task_outdated_proposal() {
         ],
     ];
 
+    // Define expectations:
+    // 1. No output for the outdated proposal
+    // 2. Validation and voting actions for the current proposal
     let expectations = vec![
-        Expectations::from_outputs(vec![]), // Expect no output for the outdated proposal
+        Expectations::from_outputs(vec![]),
         Expectations::from_outputs(vec![
             exact(HotShotEvent::DaProposalValidated(
                 view3.da_proposal.clone(),
@@ -107,6 +119,7 @@ async fn test_da_task_outdated_proposal() {
         ]),
     ];
 
+    // Define expectations for external events triggered by the system
     let external_event_expectations = vec![expect_external_events(vec![ext_event_exact(Event {
         view_number: view3.view_number,
         event: EventType::DaProposal {
@@ -115,6 +128,7 @@ async fn test_da_task_outdated_proposal() {
         },
     })])];
 
+    // Create DA task state and script for the test
     let da_state = DaTaskState::<TestTypes, MemoryImpl>::create_from(&handle).await;
     let mut da_script = TaskScript {
         timeout: Duration::from_millis(100),
@@ -122,11 +136,11 @@ async fn test_da_task_outdated_proposal() {
         expectations: expectations,
     };
 
+    // Run the test with the inputs and check the resulting events
     let output_event_stream_recv = handle.event_stream();
-
     run_test![inputs, da_script].await;
 
-    // Check external events
+    // Validate the external events against expectations
     let result = check_external_events(
         output_event_stream_recv,
         &external_event_expectations,
