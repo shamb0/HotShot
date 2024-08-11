@@ -149,3 +149,129 @@ async fn test_da_task_outdated_proposal() {
     .await;
     assert!(result.is_ok(), "{}", result.err().unwrap());
 }
+
+/// Test the DA Task for handling duplicate votes.
+///
+/// This test ensures that when duplicate votes are received in the DA Task,
+/// they are correctly ignored without producing any output. The original
+/// proposal and vote are processed as expected, validating the proposal
+/// and sending the first vote, while the duplicate vote is disregarded.
+#[cfg_attr(async_executor_impl = "tokio", tokio::test(flavor = "multi_thread"))]
+#[cfg_attr(async_executor_impl = "async-std", async_std::test)]
+async fn test_da_task_duplicate_votes() {
+    // Setup logging and backtrace for debugging
+    async_compatibility_layer::logging::setup_logging();
+    async_compatibility_layer::logging::setup_backtrace();
+
+    // Parameters for the test
+    let node_id: u64 = 2;
+    let num_nodes: usize = 10;
+    let da_committee_size: usize = 7;
+
+    // Initialize test description with node and committee details
+    let mut test_description = TestDescription::default();
+    test_description.num_nodes_with_stake = num_nodes;
+    test_description.da_staked_committee_size = da_committee_size;
+    test_description.start_nodes = num_nodes;
+
+    // Generate a launcher for the test system with a custom configuration
+    let launcher = test_description
+        .gen_launcher(node_id)
+        .modify_default_config(|config| {
+            config.next_view_timeout = 1000;
+            config.timeout_ratio = (12, 10);
+            config.da_staked_committee_size = da_committee_size;
+        });
+
+    // Build the system handle using the launcher configuration
+    let (handle, _event_sender, _event_receiver) =
+        build_system_handle_from_launcher::<TestTypes, MemoryImpl>(node_id, launcher, None)
+            .await
+            .expect("Failed to initialize HotShot");
+
+    // Prepare empty transactions and compute a commitment for later use
+    let transactions = vec![TestTransaction::new(vec![0])];
+    let encoded_transactions = Arc::from(TestTransaction::encode(&transactions));
+    let (payload_commit, _precompute) = precompute_vid_commitment(
+        &encoded_transactions,
+        handle.hotshot.memberships.quorum_membership.total_nodes(),
+    );
+
+    // Initialize a view generator using the current memberships
+    let mut view_generator = TestViewGenerator::generate(
+        handle.hotshot.memberships.quorum_membership.clone(),
+        handle.hotshot.memberships.da_membership.clone(),
+    );
+
+    // Generate views for the test
+    let _view1 = view_generator.next().await.unwrap();
+    view_generator.add_transactions(transactions);
+    let view2 = view_generator.next().await.unwrap();
+
+    // Create a duplicate vote
+    let duplicate_vote = view2.create_da_vote(
+        DaData {
+            payload_commit: payload_commit,
+        },
+        &handle,
+    );
+
+    let inputs = vec![
+        serial![
+            HotShotEvent::ViewChange(ViewNumber::new(1)),
+            HotShotEvent::ViewChange(ViewNumber::new(2)),
+            HotShotEvent::DaProposalRecv(view2.da_proposal.clone(), view2.leader_public_key),
+        ],
+        serial![
+            // Send the original vote
+            HotShotEvent::DaVoteRecv(duplicate_vote.clone()),
+            // Send the duplicate vote
+            HotShotEvent::DaVoteRecv(duplicate_vote.clone()),
+        ],
+    ];
+
+    // We expect the task to process the proposal and the first vote, but ignore the duplicate
+    let expectations = vec![
+        Expectations::from_outputs(vec![
+            exact(HotShotEvent::DaProposalValidated(
+                view2.da_proposal.clone(),
+                view2.leader_public_key,
+            )),
+            exact(HotShotEvent::DaVoteSend(duplicate_vote.clone())),
+        ]),
+        Expectations::from_outputs(vec![
+            // No output expected for the duplicate vote
+        ]),
+    ];
+
+    // We expect to see an external event for the proposal, but not for individual votes
+    let external_event_expectations = vec![expect_external_events(vec![ext_event_exact(Event {
+        view_number: view2.view_number,
+        event: EventType::DaProposal {
+            proposal: view2.da_proposal.clone(),
+            sender: view2.leader_public_key,
+        },
+    })])];
+
+    // Create DA task state and script for the test
+    let da_state = DaTaskState::<TestTypes, MemoryImpl>::create_from(&handle).await;
+    let mut da_script = TaskScript {
+        timeout: Duration::from_millis(100),
+        state: da_state,
+        expectations: expectations,
+    };
+
+    // Run the test with the inputs and check the resulting events
+    let output_event_stream_recv = handle.event_stream();
+    run_test![inputs, da_script].await;
+
+    // Validate the external events against expectations
+    let result = check_external_events(
+        output_event_stream_recv,
+        &external_event_expectations,
+        da_script.timeout,
+    )
+    .await;
+    assert!(result.is_ok(), "{}", result.err().unwrap());
+}
+
